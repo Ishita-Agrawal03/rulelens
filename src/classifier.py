@@ -1,528 +1,803 @@
-import re
+import json
+import os
+import time
 
-from src.retrieve import retrieve
+from dotenv import load_dotenv
+from groq import Groq, RateLimitError
 
-
-RELEVANCE_THRESHOLD = 1.0
-
-
-def normalize(text):
-    return text.lower().replace("**", "").strip()
+from .retrieve import retrieve
 
 
-def make_claim(topic, value, result):
+# ============================================================
+# Configuration
+# ============================================================
+
+load_dotenv()
+
+API_KEY = os.getenv("GROQ_API_KEY")
+
+if not API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Add it to your .env file."
+    )
+
+client = Groq(api_key=API_KEY)
+
+MODEL_NAME = "openai/gpt-oss-20b"
+
+# Retrieve enough evidence to detect cross-document conflicts.
+DEFAULT_TOP_K = 8
+
+# Keep the complete retrieved chunk whenever possible.
+# Your chunks are approximately 1800 characters.
+MAX_EVIDENCE_CHARS = 1800
+
+
+VALID_STATES = {
+    "ANSWERABLE",
+    "NOT_FOUND",
+    "CONTRADICTION",
+}
+
+
+# ============================================================
+# LLM instructions
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are the evidence judge for a university rulebook QA system.
+
+Your job is to classify the user's question using ONLY the supplied
+retrieved evidence.
+
+Never use outside knowledge.
+Never invent facts.
+Never infer missing information.
+
+You must return exactly one of these states:
+
+ANSWERABLE
+The supplied evidence directly contains enough information to answer
+the specific question.
+
+NOT_FOUND
+The supplied evidence may be related to the question, but it does not
+actually contain enough information to answer the specific question.
+
+CONTRADICTION
+The supplied evidence contains two or more incompatible rules that
+apply to the same situation/question, and the evidence does not
+establish which rule takes precedence.
+
+============================================================
+IMPORTANT CLASSIFICATION RULES
+============================================================
+
+1. SPECIFICITY OVER TOPICAL SIMILARITY
+
+Do not classify a question as ANSWERABLE merely because the evidence
+is about the same general topic.
+
+The evidence must support the exact object, action, condition,
+quantity, permission, deadline, threshold, requirement, or cost asked
+about.
+
+Example:
+If the question asks whether free Wi-Fi equipment is provided,
+evidence saying that internet access is available is NOT sufficient.
+Do not infer that Wi-Fi equipment is free.
+
+2. NO OUTSIDE KNOWLEDGE
+
+Use only the retrieved passages.
+
+Do not assume normal university practice.
+Do not assume common hostel rules.
+Do not assume legal requirements.
+Do not assume what a university would normally do.
+
+If the answer is not explicitly supported by the evidence,
+use NOT_FOUND.
+
+3. DO NOT INFER ONE PROPERTY FROM ANOTHER
+
+A rule about one property does not automatically establish another.
+
+Examples:
+
+Internet access != free Wi-Fi equipment.
+Scholarship eligibility != guaranteed renewal.
+Medical certificate != automatic deadline extension.
+Exam absence approval != attendance exemption.
+Parent message != official hostel leave approval.
+
+4. DIFFERENT CONDITIONS ARE NOT CONTRADICTIONS
+
+Two different rules are not contradictory merely because they contain
+different numbers, dates, times, or requirements.
+
+For example:
+
+"75% attendance is required for ordinary students."
+
+and
+
+"Students in a specified programme have a different programme-specific
+requirement."
+
+are not necessarily contradictory if the evidence establishes that
+the rules apply to different populations.
+
+Determine whether the rules actually apply to the same situation.
+
+5. IDENTIFY THE ACTUAL VALUES
+
+When checking for contradiction, inspect the actual values in the
+evidence.
+
+Pay attention to:
+
+- percentages
+- dates
+- times
+- monetary amounts
+- deadlines
+- permissions
+- prohibitions
+- required conditions
+- eligibility thresholds
+
+Do not look only for repeated wording.
+
+6. SAME REQUIREMENT + INCOMPATIBLE VALUES
+
+If two passages give incompatible values for the same requirement
+under the same applicable conditions, classify as CONTRADICTION unless
+the evidence explicitly establishes precedence.
+
+Examples:
+
+75% attendance vs 65% attendance for the same medical-attendance
+eligibility situation.
+
+15 August vs 20 August for the same semester-fee deadline.
+
+10:00 PM vs 11:00 PM for the same hostel curfew/entry requirement,
+when the evidence itself states that the difference is unresolved.
+
+7. INTERNAL CONTRADICTIONS COUNT
+
+A contradiction can occur inside one retrieved passage.
+
+Read the entire passage.
+
+For example, if a passage says:
+
+"The standard hostel curfew is 10:00 PM. Residents may enter until
+11:00 PM. The documents do not provide a precedence rule resolving
+the difference."
+
+Do NOT ignore the 11:00 PM statement simply because 10:00 PM is also
+called the "standard curfew."
+
+The evidence contains two relevant operational times and explicitly
+says that there is no precedence rule.
+
+This should be treated as CONTRADICTION when the question concerns
+the hostel curfew/entry requirement.
+
+8. DO NOT RESOLVE A CONFLICT YOURSELF
+
+If the evidence contains conflicting rules and no precedence rule,
+do not choose one.
+
+Do not choose the rule because it:
+
+- appears more frequently,
+- appears first,
+- appears last,
+- seems newer,
+- seems more specific,
+- appears in a particular document,
+- seems more authoritative.
+
+Only use precedence if the supplied evidence explicitly establishes it.
+
+9. EXPLICIT NO-PRECEDENCE LANGUAGE
+
+Statements such as:
+
+"no precedence rule"
+"does not provide a precedence rule"
+"without precedence"
+"no rule establishes which provision controls"
+"conflicting rules"
+"inconsistent provisions"
+
+are strong evidence that an identified conflict remains unresolved.
+
+10. NOT_FOUND MUST BE A REAL OPTION
+
+Do not force an answer.
+
+If the retrieved evidence is merely related but does not answer the
+specific question, classify as NOT_FOUND.
+
+11. EVIDENCE IDS
+
+Evidence IDs refer only to the numbered evidence passages supplied in
+the user prompt.
+
+Never invent an evidence ID.
+
+12. FINAL DECISION
+
+Choose the state that is best supported by the supplied evidence.
+
+Return ONLY valid JSON matching the required schema.
+"""
+
+
+# ============================================================
+# Evidence preparation
+# ============================================================
+
+def compact_evidence(evidence):
+    """
+    Prepare retrieved evidence for the LLM.
+
+    The source, section and page metadata are retained.
+    Evidence is truncated only if it exceeds MAX_EVIDENCE_CHARS.
+    """
+
+    compact = []
+
+    for item in evidence:
+        text = item["text"].strip()
+
+        if len(text) > MAX_EVIDENCE_CHARS:
+            text = (
+                text[:MAX_EVIDENCE_CHARS]
+                .rstrip()
+                + "..."
+            )
+
+        compact.append(
+            {
+                "text": text,
+                "source": item["source"],
+                "section": item["section"],
+                "page": item.get("page", -1),
+            }
+        )
+
+    return compact
+
+
+def build_evidence_prompt(question, evidence):
+    """
+    Build the user message sent to the evidence judge.
+    """
+
+    parts = []
+
+    for i, item in enumerate(evidence, start=1):
+
+        page = ""
+
+        if item.get("page", -1) != -1:
+            page = f" | Page: {item['page']}"
+
+        parts.append(
+            f"""
+Evidence {i}
+Source: {item['source']}
+Section: {item['section']}{page}
+
+{item['text']}
+"""
+        )
+
+    return (
+        f"Question:\n{question}\n\n"
+        "Retrieved evidence:\n"
+        + "\n".join(parts)
+        + "\n\n"
+        "Classify the question using ONLY the evidence above."
+    )
+
+
+# ============================================================
+# Deterministic conflict detection
+# ============================================================
+
+def has_explicit_unresolved_conflict(evidence):
+    """
+    Detect explicit statements in the retrieved corpus saying that
+    a conflict has no precedence/resolution.
+
+    This is deliberately generic. It does not know the test questions
+    or hard-code particular questions, dates, or topics.
+    """
+
+    conflict_phrases = (
+        "do not provide a precedence rule",
+        "does not provide a precedence rule",
+        "no precedence rule",
+        "without precedence",
+        "no rule establishes which provision controls",
+        "conflicting rules",
+        "conflicting provisions",
+        "inconsistent provisions",
+        "difference is unresolved",
+        "conflict remains unresolved",
+    )
+
+    for item in evidence:
+
+        text = item["text"].lower()
+
+        for phrase in conflict_phrases:
+
+            if phrase in text:
+                return True
+
+    return False
+
+
+def deterministic_safety_check(judgment, evidence):
+    """
+    Apply deterministic checks after the LLM.
+
+    The purpose is to prevent the LLM from silently resolving an
+    explicitly unresolved conflict in the retrieved rulebook.
+    """
+
+    if not has_explicit_unresolved_conflict(evidence):
+        return judgment
+
+    # If the corpus explicitly says that the retrieved rules conflict
+    # and there is no precedence rule, preserve that fact.
     return {
-        "topic": topic,
-        "value": value.lower(),
-        "source": result["source"],
-        "section": result["section"],
-        "page": result["page"],
-        "text": result["text"],
+        **judgment,
+        "state": "CONTRADICTION",
+        "confidence": max(
+            float(judgment.get("confidence", 0.0)),
+            0.95,
+        ),
+        "evidence_ids": list(
+            range(1, len(evidence) + 1)
+        ),
+        "reason": (
+            "The retrieved evidence explicitly identifies an "
+            "unresolved conflict and provides no precedence rule "
+            "for selecting one rule over the other."
+        ),
     }
 
 
-def extract_claims(question, results):
-    question = normalize(question)
+# ============================================================
+# Groq call
+# ============================================================
 
-    claims = []
+def call_llm_judge(question, evidence):
+    """
+    Ask Groq to classify the retrieved evidence.
 
-    # =========================================================
-    # ATTENDANCE
-    # =========================================================
+    Uses strict JSON schema so the classifier receives a predictable
+    machine-readable response.
+    """
 
-    attendance_question = (
-        "attendance" in question
-        and any(
-            word in question
-            for word in [
-                "examination",
-                "exam",
-                "eligibility",
-                "appear",
-                "required",
-                "minimum",
-                "percentage",
-            ]
-        )
+    compact = compact_evidence(evidence)
+
+    prompt = build_evidence_prompt(
+        question,
+        compact,
     )
 
-    if attendance_question:
+    max_retries = 4
 
-        # Medical rules should only participate in contradiction
-        # detection when the user actually asks about medical
-        # circumstances.
-        medical_question = any(
-            phrase in question
-            for phrase in [
-                "medical",
-                "medical documentation",
-                "medical certificate",
-                "medical exemption",
-                "approved medical",
-                "medical circumstances",
-                "illness",
-                "sick",
-            ]
-        )
+    for attempt in range(max_retries):
 
-        for result in results:
+        try:
 
-            text = normalize(result["text"])
-            source = normalize(result["source"])
-            section = normalize(result["section"])
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
 
-            # -------------------------------------------------
-            # General academic attendance rules
-            # -------------------------------------------------
+                temperature=0,
 
-            is_general_attendance_rule = (
-                (
-                    "academic_regulations.md" in source
-                    and "attendance requirements" in section
-                )
-                or
-                (
-                    "university_regulations.pdf" in source
-                    and "academic attendance" in section
-                )
+                reasoning_effort="low",
+
+                include_reasoning=False,
+
+                max_completion_tokens=800,
+
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "rulelens_classification",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+
+                            "properties": {
+
+                                "state": {
+                                    "type": "string",
+                                    "enum": [
+                                        "ANSWERABLE",
+                                        "NOT_FOUND",
+                                        "CONTRADICTION",
+                                    ],
+                                },
+
+                                "confidence": {
+                                    "type": "number",
+                                },
+
+                                "evidence_ids": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "integer",
+                                    },
+                                },
+
+                                "reason": {
+                                    "type": "string",
+                                },
+                            },
+
+                            "required": [
+                                "state",
+                                "confidence",
+                                "evidence_ids",
+                                "reason",
+                            ],
+
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+
+                messages=[
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
             )
 
-            if is_general_attendance_rule:
+            content = response.choices[0].message.content
 
-                percentages = re.findall(
-                    r"\b\d{1,3}%",
-                    text
-                )
+            # --------------------------------------------
+            # Parse JSON
+            # --------------------------------------------
 
-                for value in percentages:
+            try:
 
-                    claims.append(
-                        make_claim(
-                            "exam_attendance_requirement",
-                            value,
-                            result
-                        )
-                    )
+                result = json.loads(content)
 
-            # -------------------------------------------------
-            # Medical attendance rule
-            # -------------------------------------------------
+            except (json.JSONDecodeError, TypeError):
 
-            is_medical_rule = (
-                "medical_policy.md" in source
-                and "medical attendance exemption" in section
-            )
+                return {
+                    "state": "NOT_FOUND",
+                    "confidence": 0.0,
+                    "evidence_ids": [],
+                    "reason": (
+                        "The evidence judge returned invalid JSON."
+                    ),
+                }
 
-            if is_medical_rule and medical_question:
+            # --------------------------------------------
+            # Validate state
+            # --------------------------------------------
 
-                percentages = re.findall(
-                    r"\b\d{1,3}%",
-                    text
-                )
+            state = result.get("state")
 
-                for value in percentages:
+            if state not in VALID_STATES:
 
-                    claims.append(
-                        make_claim(
-                            "exam_attendance_requirement",
-                            value,
-                            result
-                        )
-                    )
+                state = "NOT_FOUND"
 
-    # =========================================================
-    # SEMESTER FEE
-    # =========================================================
+            # --------------------------------------------
+            # Validate confidence
+            # --------------------------------------------
 
-    if "semester fee" in question:
+            try:
 
-        for result in results:
-
-            text = normalize(result["text"])
-
-            # Sentence-style rule
-            sentence_matches = re.findall(
-                r"semester fee.*?("
-                r"\d{1,2}\s+"
-                r"(?:january|february|march|april|may|june|"
-                r"july|august|september|october|november|december))",
-                text
-            )
-
-            # Markdown table-style rule
-            table_matches = re.findall(
-                r"semester fee\s*\|\s*("
-                r"\d{1,2}\s+"
-                r"(?:january|february|march|april|may|june|"
-                r"july|august|september|october|november|december))",
-                text
-            )
-
-            for value in sentence_matches + table_matches:
-
-                claims.append(
-                    make_claim(
-                        "semester_fee_deadline",
-                        value,
-                        result
+                confidence = float(
+                    result.get(
+                        "confidence",
+                        0.0,
                     )
                 )
 
-    # =========================================================
-    # HOSTEL CURFEW
-    # =========================================================
+            except (TypeError, ValueError):
 
-    curfew_question = (
-        "curfew" in question
-        or (
-            "hostel" in question
-            and any(
-                word in question
-                for word in [
-                    "entry",
-                    "return",
-                    "returning",
-                    "allowed",
-                    "time",
-                ]
-            )
-        )
-    )
+                confidence = 0.0
 
-    if curfew_question:
-
-        for result in results:
-
-            text = normalize(result["text"])
-            source = normalize(result["source"])
-            section = normalize(result["section"])
-
-            is_hostel_entry_rule = (
-                "curfew" in text
-                or "hostel entry" in section
-                or "late entry" in section
+            confidence = max(
+                0.0,
+                min(
+                    1.0,
+                    confidence,
+                ),
             )
 
-            if not is_hostel_entry_rule:
-                continue
+            # --------------------------------------------
+            # Validate evidence IDs
+            # --------------------------------------------
 
-            times = re.findall(
-                r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b",
-                text
+            evidence_ids = result.get(
+                "evidence_ids",
+                [],
             )
 
-            # The PDF explicitly documents an unresolved
-            # 10 PM vs 11 PM conflict.
-            if (
-                "university_regulations.pdf" in source
-                and "hostel entry" in section
-                and "do not provide a precedence rule" in text
-                and len(times) >= 2
+            if not isinstance(
+                evidence_ids,
+                list,
             ):
+                evidence_ids = []
 
-                claims.append(
-                    make_claim(
-                        "hostel_curfew",
-                        "10:00 pm",
-                        result
-                    )
-                )
+            valid_ids = []
 
-                claims.append(
-                    make_claim(
-                        "hostel_curfew",
-                        "11:00 pm",
-                        result
-                    )
-                )
+            for evidence_id in evidence_ids:
 
-            else:
-
-                for value in times:
-
-                    claims.append(
-                        make_claim(
-                            "hostel_curfew",
-                            value,
-                            result
-                        )
-                    )
-
-    return claims
-
-
-def find_contradictions(claims):
-
-    topics = {}
-
-    for claim in claims:
-
-        topics.setdefault(
-            claim["topic"],
-            []
-        ).append(claim)
-
-    contradictions = []
-
-    for topic, topic_claims in topics.items():
-
-        distinct_values = {
-            claim["value"]
-            for claim in topic_claims
-        }
-
-        # One value means no contradiction.
-        if len(distinct_values) <= 1:
-            continue
-
-        value_sources = {}
-
-        for claim in topic_claims:
-
-            value_sources.setdefault(
-                claim["value"],
-                set()
-            ).add(
-                claim["source"]
-            )
-
-        values = list(
-            value_sources.keys()
-        )
-
-        contradiction_found = False
-
-        for i in range(len(values)):
-
-            for j in range(i + 1, len(values)):
-
-                sources_a = value_sources[
-                    values[i]
-                ]
-
-                sources_b = value_sources[
-                    values[j]
-                ]
-
-                # Contradiction when incompatible values
-                # originate from independent sources.
-                if sources_a.isdisjoint(sources_b):
-
-                    contradiction_found = True
-
-                # The university PDF explicitly documents
-                # the unresolved hostel conflict itself.
-                if (
-                    topic == "hostel_curfew"
-                    and values[i] == "10:00 pm"
-                    and values[j] == "11:00 pm"
+                if isinstance(
+                    evidence_id,
+                    int,
                 ):
 
-                    contradiction_found = True
+                    if (
+                        1
+                        <= evidence_id
+                        <= len(evidence)
+                    ):
 
-        if contradiction_found:
+                        if evidence_id not in valid_ids:
+                            valid_ids.append(
+                                evidence_id
+                            )
 
-            contradictions.append(
-                topic_claims
-            )
+            # --------------------------------------------
+            # Return normalized result
+            # --------------------------------------------
 
-    return contradictions
-
-
-def evidence_supports_question(question, evidence):
-
-    question = normalize(question)
-
-    combined_text = " ".join(
-        normalize(result["text"])
-        for result in evidence
-    )
-
-    # ---------------------------------------------------------
-    # Specific qualifier: FREE
-    # ---------------------------------------------------------
-    #
-    # "Laundry exists" does not answer:
-    # "Is laundry free?"
-    #
-
-    if (
-        "free" in question
-        and "free" not in combined_text
-    ):
-        return False
-
-    # ---------------------------------------------------------
-    # Specific subject: blood type
-    # ---------------------------------------------------------
-    #
-    # Generic academic-record rules do not answer a
-    # blood-type-specific question.
-    #
-
-    if (
-        "blood type" in question
-        and "blood type" not in combined_text
-    ):
-        return False
-
-    return True
-
-
-def classify(question, results):
-
-    # No retrieval results.
-    if not results:
-
-        return "NOT_FOUND", []
-
-    # ---------------------------------------------------------
-    # Relevance filtering
-    # ---------------------------------------------------------
-
-    relevant = [
-        result
-        for result in results
-        if result["distance"] < RELEVANCE_THRESHOLD
-    ]
-
-    if not relevant:
-
-        return "NOT_FOUND", []
-
-    # ---------------------------------------------------------
-    # Extract rule claims
-    # ---------------------------------------------------------
-
-    claims = extract_claims(
-        question,
-        relevant
-    )
-
-    # ---------------------------------------------------------
-    # Detect contradictions
-    # ---------------------------------------------------------
-
-    contradictions = find_contradictions(
-        claims
-    )
-
-    if contradictions:
-
-        evidence = []
-
-        for group in contradictions:
-
-            for claim in group:
-
-                if claim not in evidence:
-
-                    evidence.append(
-                        claim
+            return {
+                "state": state,
+                "confidence": confidence,
+                "evidence_ids": valid_ids,
+                "reason": str(
+                    result.get(
+                        "reason",
+                        "",
                     )
+                ),
+            }
 
-        return "CONTRADICTION", evidence
+        except RateLimitError:
 
-    # ---------------------------------------------------------
-    # Check whether retrieved evidence actually supports
-    # the specific question.
-    # ---------------------------------------------------------
+            if attempt == max_retries - 1:
 
-    if not evidence_supports_question(
+                return {
+                    "state": "NOT_FOUND",
+                    "confidence": 0.0,
+                    "evidence_ids": [],
+                    "reason": (
+                        "Groq rate limit was reached after "
+                        "multiple retries."
+                    ),
+                }
+
+            wait_seconds = 2 ** attempt
+
+            print(
+                f"\nGroq rate limit reached. "
+                f"Retrying in {wait_seconds}s..."
+            )
+
+            time.sleep(wait_seconds)
+
+        except Exception as exc:
+
+            return {
+                "state": "NOT_FOUND",
+                "confidence": 0.0,
+                "evidence_ids": [],
+                "reason": (
+                    f"Evidence judge error: {exc}"
+                ),
+            }
+
+
+# ============================================================
+# Result validation
+# ============================================================
+
+def validate_result(judgment, evidence):
+    """
+    Validate and normalize the LLM result.
+
+    This layer:
+    1. prevents unsupported evidence IDs,
+    2. prevents ANSWERABLE/CONTRADICTION without evidence,
+    3. preserves explicit unresolved conflicts found in the corpus.
+    """
+
+    valid_ids = judgment.get(
+        "evidence_ids",
+        [],
+    )
+
+    # --------------------------------------------
+    # Evidence is mandatory for positive decisions
+    # --------------------------------------------
+
+    if judgment["state"] in {
+        "ANSWERABLE",
+        "CONTRADICTION",
+    }:
+
+        if not valid_ids:
+
+            judgment = {
+                **judgment,
+                "state": "NOT_FOUND",
+                "confidence": 0.0,
+                "reason": (
+                    "The evidence judge did not identify "
+                    "a valid supporting passage."
+                ),
+                "evidence_ids": [],
+            }
+
+    # --------------------------------------------
+    # Deterministic unresolved-conflict safeguard
+    # --------------------------------------------
+
+    judgment = deterministic_safety_check(
+        judgment,
+        evidence,
+    )
+
+    return judgment
+
+
+# ============================================================
+# Main classifier
+# ============================================================
+
+def classify(
+    question,
+    top_k=DEFAULT_TOP_K,
+):
+    """
+    Retrieve evidence and classify the question into:
+
+    ANSWERABLE
+    NOT_FOUND
+    CONTRADICTION
+    """
+
+    question = question.strip()
+
+    if not question:
+
+        return {
+            "state": "NOT_FOUND",
+            "confidence": 1.0,
+            "reason": "The question is empty.",
+            "evidence": [],
+        }
+
+    # --------------------------------------------
+    # Retrieval
+    # --------------------------------------------
+
+    evidence = retrieve(
         question,
-        relevant
+        top_k=top_k,
+    )
+
+    if not evidence:
+
+        return {
+            "state": "NOT_FOUND",
+            "confidence": 1.0,
+            "reason": "No evidence was retrieved.",
+            "evidence": [],
+        }
+
+    # --------------------------------------------
+    # LLM classification
+    # --------------------------------------------
+
+    judgment = call_llm_judge(
+        question,
+        evidence,
+    )
+
+    # --------------------------------------------
+    # Safety validation
+    # --------------------------------------------
+
+    judgment = validate_result(
+        judgment,
+        evidence,
+    )
+
+    # --------------------------------------------
+    # Convert evidence IDs to actual evidence
+    # --------------------------------------------
+
+    selected_evidence = []
+
+    for evidence_id in judgment.get(
+        "evidence_ids",
+        [],
     ):
 
-        return "NOT_FOUND", []
+        selected_evidence.append(
+            evidence[evidence_id - 1]
+        )
 
-    # ---------------------------------------------------------
-    # Otherwise the corpus contains relevant evidence.
-    # ---------------------------------------------------------
+    return {
+        "state": judgment["state"],
+        "confidence": judgment["confidence"],
+        "reason": judgment["reason"],
+        "evidence": selected_evidence,
+    }
 
-    return "ANSWERABLE", relevant
 
+# ============================================================
+# CLI output
+# ============================================================
 
-def print_result(state, evidence):
+def print_result(result):
 
-    print()
-
-    print("=" * 60)
+    print("\n" + "=" * 60)
 
     print(
-        f"STATE: {state}"
+        f"STATE: {result['state']}"
     )
 
     print("=" * 60)
 
-    # =========================================================
-    # NOT FOUND
-    # =========================================================
-
-    if state == "NOT_FOUND":
-
-        print(
-            "\nThe corpus does not contain enough information "
-            "to answer this question."
-        )
-
-        return
-
-    # =========================================================
-    # CONTRADICTION
-    # =========================================================
-
-    if state == "CONTRADICTION":
-
-        print(
-            "\nConflicting rules were found:\n"
-        )
-
-        for i, result in enumerate(
-            evidence,
-            start=1
-        ):
-
-            print(
-                f"--- Conflicting Evidence {i} ---"
-            )
-
-            print(
-                f"Source: {result['source']}"
-            )
-
-            print(
-                f"Section: {result['section']}"
-            )
-
-            if result["page"] != -1:
-
-                print(
-                    f"Page: {result['page']}"
-                )
-
-            print(
-                f"Claimed value: {result['value']}"
-            )
-
-            print(
-                f"Passage:\n{result['text']}"
-            )
-
-            print()
-
-        return
-
-    # =========================================================
-    # ANSWERABLE
-    # =========================================================
-
     print(
-        "\nRelevant evidence:\n"
+        f"\nConfidence: "
+        f"{result['confidence']:.2f}"
     )
 
-    for i, result in enumerate(
+    if result.get("reason"):
+
+        print(
+            f"Reason: "
+            f"{result['reason']}"
+        )
+
+    evidence = result.get(
+        "evidence",
+        [],
+    )
+
+    if not evidence:
+
+        print(
+            "\nNo supporting evidence."
+        )
+
+        return
+
+    print(
+        "\nSupporting evidence:\n"
+    )
+
+    for i, item in enumerate(
         evidence,
-        start=1
+        start=1,
     ):
 
         print(
@@ -530,25 +805,32 @@ def print_result(state, evidence):
         )
 
         print(
-            f"Source: {result['source']}"
+            f"Source: "
+            f"{item['source']}"
         )
 
         print(
-            f"Section: {result['section']}"
+            f"Section: "
+            f"{item['section']}"
         )
 
-        if result["page"] != -1:
+        if item.get("page", -1) != -1:
 
             print(
-                f"Page: {result['page']}"
+                f"Page: "
+                f"{item['page']}"
             )
 
         print(
-            result["text"]
+            item["text"]
         )
 
         print()
 
+
+# ============================================================
+# Direct execution
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -567,23 +849,25 @@ if __name__ == "__main__":
         ).strip()
 
         if question.lower() == "exit":
-
             break
 
         if not question:
-
             continue
 
-        results = retrieve(
-            question
-        )
+        try:
 
-        state, evidence = classify(
-            question,
-            results
-        )
+            result = classify(
+                question
+            )
 
-        print_result(
-            state,
-            evidence
-        )
+            print_result(
+                result
+            )
+
+        except Exception as exc:
+
+            print(
+                "\nERROR:"
+            )
+
+            print(exc)

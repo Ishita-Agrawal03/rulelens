@@ -1,3 +1,6 @@
 pypdf
 sentence-transformers
 chromadb
+streamlit
+groq
+python-dotenv
