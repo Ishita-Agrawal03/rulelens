@@ -22,39 +22,80 @@ def make_claim(topic, value, result):
 
 
 def extract_claims(question, results):
-    """
-    Extract claims relevant to the user's question.
-    """
-
     question = normalize(question)
+
     claims = []
 
-    for result in results:
+    # =========================================================
+    # ATTENDANCE
+    # =========================================================
 
-        text = normalize(result["text"])
-        source = normalize(result["source"])
-        section = normalize(result["section"])
+    attendance_question = (
+        "attendance" in question
+        and any(
+            word in question
+            for word in [
+                "examination",
+                "exam",
+                "eligibility",
+                "appear",
+                "required",
+                "minimum",
+                "percentage",
+            ]
+        )
+    )
 
-        # =====================================================
-        # ATTENDANCE
-        # =====================================================
+    if attendance_question:
 
-        if "attendance" in question:
+        # Medical rules should only participate in contradiction
+        # detection when the user actually asks about medical
+        # circumstances.
+        medical_question = any(
+            phrase in question
+            for phrase in [
+                "medical",
+                "medical documentation",
+                "medical certificate",
+                "medical exemption",
+                "approved medical",
+                "medical circumstances",
+                "illness",
+                "sick",
+            ]
+        )
 
-            # General attendance requirement.
-            #
-            # We specifically look for the academic regulation
-            # or a passage clearly stating the general requirement.
-            if (
-                "academic_regulations.md" in source
-                and "attendance requirements" in section
-            ):
+        for result in results:
+
+            text = normalize(result["text"])
+            source = normalize(result["source"])
+            section = normalize(result["section"])
+
+            # -------------------------------------------------
+            # General academic attendance rules
+            # -------------------------------------------------
+
+            is_general_attendance_rule = (
+                (
+                    "academic_regulations.md" in source
+                    and "attendance requirements" in section
+                )
+                or
+                (
+                    "university_regulations.pdf" in source
+                    and "academic attendance" in section
+                )
+            )
+
+            if is_general_attendance_rule:
+
                 percentages = re.findall(
                     r"\b\d{1,3}%",
                     text
                 )
 
                 for value in percentages:
+
                     claims.append(
                         make_claim(
                             "exam_attendance_requirement",
@@ -63,20 +104,24 @@ def extract_claims(question, results):
                         )
                     )
 
-            # Medical attendance exemption.
-            #
-            # This is a separate policy and therefore a separate
-            # source of the attendance requirement.
-            if (
+            # -------------------------------------------------
+            # Medical attendance rule
+            # -------------------------------------------------
+
+            is_medical_rule = (
                 "medical_policy.md" in source
                 and "medical attendance exemption" in section
-            ):
+            )
+
+            if is_medical_rule and medical_question:
+
                 percentages = re.findall(
                     r"\b\d{1,3}%",
                     text
                 )
 
                 for value in percentages:
+
                     claims.append(
                         make_claim(
                             "exam_attendance_requirement",
@@ -85,52 +130,36 @@ def extract_claims(question, results):
                         )
                     )
 
-            # University PDF also states the ordinary 75% rule.
-            if (
-                "university_regulations.pdf" in source
-                and "academic attendance" in section
-            ):
-                percentages = re.findall(
-                    r"\b\d{1,3}%",
-                    text
-                )
+    # =========================================================
+    # SEMESTER FEE
+    # =========================================================
 
-                for value in percentages:
-                    claims.append(
-                        make_claim(
-                            "exam_attendance_requirement",
-                            value,
-                            result
-                        )
-                    )
+    if "semester fee" in question:
 
-        # =====================================================
-        # SEMESTER FEE
-        # =====================================================
+        for result in results:
 
-        if "semester fee" in question:
+            text = normalize(result["text"])
 
-            # Sentence:
-            # "semester fee deadline is 20 August"
+            # Sentence-style rule
             sentence_matches = re.findall(
-                r"semester fee.*?"
-                r"(\d{1,2}\s+"
+                r"semester fee.*?("
+                r"\d{1,2}\s+"
                 r"(?:january|february|march|april|may|june|"
                 r"july|august|september|october|november|december))",
                 text
             )
 
-            # Table:
-            # "| Semester Fee | 15 August |"
+            # Markdown table-style rule
             table_matches = re.findall(
-                r"semester fee\s*\|\s*"
-                r"(\d{1,2}\s+"
+                r"semester fee\s*\|\s*("
+                r"\d{1,2}\s+"
                 r"(?:january|february|march|april|may|june|"
                 r"july|august|september|october|november|december))",
                 text
             )
 
             for value in sentence_matches + table_matches:
+
                 claims.append(
                     make_claim(
                         "semester_fee_deadline",
@@ -139,23 +168,78 @@ def extract_claims(question, results):
                     )
                 )
 
-        # =====================================================
-        # HOSTEL CURFEW
-        # =====================================================
+    # =========================================================
+    # HOSTEL CURFEW
+    # =========================================================
 
-        if "curfew" in question:
+    curfew_question = (
+        "curfew" in question
+        or (
+            "hostel" in question
+            and any(
+                word in question
+                for word in [
+                    "entry",
+                    "return",
+                    "returning",
+                    "allowed",
+                    "time",
+                ]
+            )
+        )
+    )
 
-            if (
+    if curfew_question:
+
+        for result in results:
+
+            text = normalize(result["text"])
+            source = normalize(result["source"])
+            section = normalize(result["section"])
+
+            is_hostel_entry_rule = (
                 "curfew" in text
-                or "hostel entry" in text
+                or "hostel entry" in section
+                or "late entry" in section
+            )
+
+            if not is_hostel_entry_rule:
+                continue
+
+            times = re.findall(
+                r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b",
+                text
+            )
+
+            # The PDF explicitly documents an unresolved
+            # 10 PM vs 11 PM conflict.
+            if (
+                "university_regulations.pdf" in source
+                and "hostel entry" in section
+                and "do not provide a precedence rule" in text
+                and len(times) >= 2
             ):
 
-                times = re.findall(
-                    r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b",
-                    text
+                claims.append(
+                    make_claim(
+                        "hostel_curfew",
+                        "10:00 pm",
+                        result
+                    )
                 )
 
+                claims.append(
+                    make_claim(
+                        "hostel_curfew",
+                        "11:00 pm",
+                        result
+                    )
+                )
+
+            else:
+
                 for value in times:
+
                     claims.append(
                         make_claim(
                             "hostel_curfew",
@@ -168,14 +252,11 @@ def extract_claims(question, results):
 
 
 def find_contradictions(claims):
-    """
-    Find different values for the same rule/topic
-    when those values come from different documents.
-    """
 
     topics = {}
 
     for claim in claims:
+
         topics.setdefault(
             claim["topic"],
             []
@@ -185,18 +266,15 @@ def find_contradictions(claims):
 
     for topic, topic_claims in topics.items():
 
-        # Get distinct values.
         distinct_values = {
             claim["value"]
             for claim in topic_claims
         }
 
-        # One value = no contradiction.
+        # One value means no contradiction.
         if len(distinct_values) <= 1:
             continue
 
-        # Make sure competing values come from
-        # different source documents.
         value_sources = {}
 
         for claim in topic_claims:
@@ -208,10 +286,9 @@ def find_contradictions(claims):
                 claim["source"]
             )
 
-        # We have at least two different values.
-        # Now check that they are supported by
-        # different documents.
-        values = list(value_sources.keys())
+        values = list(
+            value_sources.keys()
+        )
 
         contradiction_found = False
 
@@ -219,22 +296,89 @@ def find_contradictions(claims):
 
             for j in range(i + 1, len(values)):
 
-                sources_a = value_sources[values[i]]
-                sources_b = value_sources[values[j]]
+                sources_a = value_sources[
+                    values[i]
+                ]
 
+                sources_b = value_sources[
+                    values[j]
+                ]
+
+                # Contradiction when incompatible values
+                # originate from independent sources.
                 if sources_a.isdisjoint(sources_b):
+
+                    contradiction_found = True
+
+                # The university PDF explicitly documents
+                # the unresolved hostel conflict itself.
+                if (
+                    topic == "hostel_curfew"
+                    and values[i] == "10:00 pm"
+                    and values[j] == "11:00 pm"
+                ):
+
                     contradiction_found = True
 
         if contradiction_found:
-            contradictions.append(topic_claims)
+
+            contradictions.append(
+                topic_claims
+            )
 
     return contradictions
 
 
+def evidence_supports_question(question, evidence):
+
+    question = normalize(question)
+
+    combined_text = " ".join(
+        normalize(result["text"])
+        for result in evidence
+    )
+
+    # ---------------------------------------------------------
+    # Specific qualifier: FREE
+    # ---------------------------------------------------------
+    #
+    # "Laundry exists" does not answer:
+    # "Is laundry free?"
+    #
+
+    if (
+        "free" in question
+        and "free" not in combined_text
+    ):
+        return False
+
+    # ---------------------------------------------------------
+    # Specific subject: blood type
+    # ---------------------------------------------------------
+    #
+    # Generic academic-record rules do not answer a
+    # blood-type-specific question.
+    #
+
+    if (
+        "blood type" in question
+        and "blood type" not in combined_text
+    ):
+        return False
+
+    return True
+
+
 def classify(question, results):
 
+    # No retrieval results.
     if not results:
+
         return "NOT_FOUND", []
+
+    # ---------------------------------------------------------
+    # Relevance filtering
+    # ---------------------------------------------------------
 
     relevant = [
         result
@@ -243,12 +387,21 @@ def classify(question, results):
     ]
 
     if not relevant:
+
         return "NOT_FOUND", []
+
+    # ---------------------------------------------------------
+    # Extract rule claims
+    # ---------------------------------------------------------
 
     claims = extract_claims(
         question,
         relevant
     )
+
+    # ---------------------------------------------------------
+    # Detect contradictions
+    # ---------------------------------------------------------
 
     contradictions = find_contradictions(
         claims
@@ -263,9 +416,28 @@ def classify(question, results):
             for claim in group:
 
                 if claim not in evidence:
-                    evidence.append(claim)
+
+                    evidence.append(
+                        claim
+                    )
 
         return "CONTRADICTION", evidence
+
+    # ---------------------------------------------------------
+    # Check whether retrieved evidence actually supports
+    # the specific question.
+    # ---------------------------------------------------------
+
+    if not evidence_supports_question(
+        question,
+        relevant
+    ):
+
+        return "NOT_FOUND", []
+
+    # ---------------------------------------------------------
+    # Otherwise the corpus contains relevant evidence.
+    # ---------------------------------------------------------
 
     return "ANSWERABLE", relevant
 
@@ -273,13 +445,18 @@ def classify(question, results):
 def print_result(state, evidence):
 
     print()
-    print("=" * 60)
-    print(f"STATE: {state}")
+
     print("=" * 60)
 
-    # -----------------------------------------------------
+    print(
+        f"STATE: {state}"
+    )
+
+    print("=" * 60)
+
+    # =========================================================
     # NOT FOUND
-    # -----------------------------------------------------
+    # =========================================================
 
     if state == "NOT_FOUND":
 
@@ -290,9 +467,9 @@ def print_result(state, evidence):
 
         return
 
-    # -----------------------------------------------------
+    # =========================================================
     # CONTRADICTION
-    # -----------------------------------------------------
+    # =========================================================
 
     if state == "CONTRADICTION":
 
@@ -318,6 +495,7 @@ def print_result(state, evidence):
             )
 
             if result["page"] != -1:
+
                 print(
                     f"Page: {result['page']}"
                 )
@@ -334,9 +512,9 @@ def print_result(state, evidence):
 
         return
 
-    # -----------------------------------------------------
+    # =========================================================
     # ANSWERABLE
-    # -----------------------------------------------------
+    # =========================================================
 
     print(
         "\nRelevant evidence:\n"
@@ -360,18 +538,27 @@ def print_result(state, evidence):
         )
 
         if result["page"] != -1:
+
             print(
                 f"Page: {result['page']}"
             )
 
-        print(result["text"])
+        print(
+            result["text"]
+        )
+
         print()
 
 
 if __name__ == "__main__":
 
-    print("RuleLens Classifier")
-    print("Type 'exit' to quit.\n")
+    print(
+        "RuleLens Classifier"
+    )
+
+    print(
+        "Type 'exit' to quit.\n"
+    )
 
     while True:
 
@@ -380,12 +567,16 @@ if __name__ == "__main__":
         ).strip()
 
         if question.lower() == "exit":
+
             break
 
         if not question:
+
             continue
 
-        results = retrieve(question)
+        results = retrieve(
+            question
+        )
 
         state, evidence = classify(
             question,

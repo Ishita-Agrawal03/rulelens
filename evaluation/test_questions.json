@@ -1,0 +1,122 @@
+[
+  {
+    "question": "What is the minimum attendance required to sit for semester-end exams?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Can I register for a course after the semester has started?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "When is the semester fee due?",
+    "expected_state": "CONTRADICTION"
+  },
+  {
+    "question": "Can I bring a pet into the hostel?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "What is the minimum attendance requirement for examinations?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What happens if I miss an examination because of a documented medical emergency?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Are family weddings automatically accepted as reasons for missing an examination?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "How many days do I have to submit an attendance representation?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What is the standard hostel curfew?",
+    "expected_state": "CONTRADICTION"
+  },
+  {
+  "question": "Can I have a visitor in my hostel room overnight?",
+  "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What happens if I submit false medical documents?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Does an approved medical certificate automatically extend every academic deadline?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Is scholarship renewal guaranteed if I received the scholarship last year?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Does failing one course automatically cancel every scholarship?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What is the hostel fee deadline?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What is the examination fee deadline?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Can an official university notice change a fee deadline?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Can a student's parent approve hostel leave by sending a message?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What happens when two institutional rules conflict and neither has precedence?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Can I transfer attendance from one course to another?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "What percentage of attendance is required for students with approved medical documentation?",
+    "expected_state": "CONTRADICTION"
+  },
+  {
+    "question": "Can I graduate without completing the published graduation requirements?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Is a request for an exception automatically an approval?",
+    "expected_state": "ANSWERABLE"
+  },
+  {
+    "question": "Can I keep a motorcycle inside the hostel room?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "What is the university's policy on changing a student's blood type in academic records?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "Does the university provide a free laptop to every student?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "Can students bring a pet into the library?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "What is the university's rule for drone ownership?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "Does the hostel provide free laundry service?",
+    "expected_state": "NOT_FOUND"
+  },
+  {
+    "question": "What is the rule for changing a student's preferred pronouns in university records?",
+    "expected_state": "NOT_FOUND"
+  }
+]

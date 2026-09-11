@@ -1,7 +1,5 @@
-import json
-from pathlib import Path
-
 import chromadb
+from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
 
@@ -12,16 +10,19 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 COLLECTION_NAME = "rulebook"
 
 
+# Load the embedding model once when this module is imported.
+MODEL = SentenceTransformer(MODEL_NAME)
+
+
 def get_collection():
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     return client.get_collection(name=COLLECTION_NAME)
 
 
-def retrieve(question, top_k=5):
-    model = SentenceTransformer(MODEL_NAME)
+def retrieve(question, top_k=8):
     collection = get_collection()
 
-    question_embedding = model.encode(
+    question_embedding = MODEL.encode(
         [question],
         normalize_embeddings=True
     ).tolist()
@@ -43,6 +44,7 @@ def retrieve(question, top_k=5):
         })
 
     return retrieved
+
 
 if __name__ == "__main__":
     print("RuleLens Retrieval")
